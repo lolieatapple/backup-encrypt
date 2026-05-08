@@ -189,7 +189,8 @@ log "start: $SRC_DIR -> $OUT"
 trap 'rm -f "$TMP"' ERR
 
 tar -czf - -C "$(dirname "$SRC_DIR")" "$(basename "$SRC_DIR")" \
-    | gpg --batch --yes --quiet \
+    | gpg --batch --yes --quiet --no-tty \
+          --pinentry-mode loopback \
           --symmetric --cipher-algo AES256 \
           --compress-algo none \
           --passphrase-file "$PASS_FILE" \

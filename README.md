@@ -65,12 +65,14 @@ Each successful run produces:
 ## Restore
 
 ```bash
-gpg --decrypt --batch --passphrase-file /etc/backup-encrypt/<name>.pass \
+gpg --decrypt --batch --pinentry-mode loopback \
+    --passphrase-file /etc/backup-encrypt/<name>.pass \
     /<dest>/<name>-YYYYMMDD-HHMMSS.tar.gz.gpg | tar -xzf -
 ```
 
 If you only have the password (no passphrase file), drop `--batch
---passphrase-file ...` and `gpg` will prompt interactively.
+--pinentry-mode loopback --passphrase-file ...` and `gpg` will prompt
+interactively.
 
 ## Uninstall
 
