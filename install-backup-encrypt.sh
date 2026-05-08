@@ -11,6 +11,7 @@
 
 set -euo pipefail
 
+VERSION="0.2.0"
 BIN_DIR="/usr/local/bin"
 ETC_DIR="/etc/backup-encrypt"
 LOG_DIR="/var/log"
@@ -41,6 +42,52 @@ ensure_deps() {
         apt-get update -qq
         apt-get install -y "${missing[@]}"
     fi
+}
+
+# 用真实密码文件做一次最小加密测试，验证 gpg loopback 可用。
+# 失败就尝试自动配置 gpg-agent.conf 的 allow-loopback-pinentry 并重载。
+gpg_self_test() {
+    local pass_file="$1"
+    local err
+    _try_gpg() {
+        printf 'probe' \
+            | gpg --batch --yes --quiet --no-tty \
+                  --pinentry-mode loopback \
+                  --symmetric --cipher-algo AES256 \
+                  --compress-algo none \
+                  --passphrase-file "$pass_file" \
+                  --output /dev/null 2>&1
+    }
+
+    if err=$(_try_gpg); then
+        c_dim "✓ gpg 加密自检通过"
+        return 0
+    fi
+
+    c_red "gpg 加密自检失败:"
+    printf '%s\n' "$err" | sed 's/^/    /'
+
+    if printf '%s' "$err" | grep -qiE 'pinentry|loopback|inappropriate ioctl'; then
+        local home="${GNUPGHOME:-$HOME/.gnupg}"
+        local conf="$home/gpg-agent.conf"
+        c_cyan "尝试自动修复: 在 $conf 添加 allow-loopback-pinentry 并重载 gpg-agent"
+        mkdir -p "$home"
+        chmod 700 "$home"
+        if [[ ! -f "$conf" ]] || ! grep -qE '^[[:space:]]*allow-loopback-pinentry' "$conf"; then
+            printf 'allow-loopback-pinentry\n' >> "$conf"
+        fi
+        gpgconf --kill gpg-agent >/dev/null 2>&1 || true
+        gpg-connect-agent reloadagent /bye >/dev/null 2>&1 || true
+
+        if err=$(_try_gpg); then
+            c_green "✓ gpg-agent 修复后自检通过"
+            return 0
+        fi
+        c_red "修复后仍然失败:"
+        printf '%s\n' "$err" | sed 's/^/    /'
+    fi
+
+    die "gpg 加密失败，安装已中止 (可手动检查 gpg-agent / 密码文件)"
 }
 
 # ---------- 交互输入 ----------
@@ -160,6 +207,7 @@ set -euo pipefail
 SCRIPT_HEAD
 
     cat >> "$script_path" <<EOF
+INSTALLER_VERSION="${VERSION}"
 NAME="${name}"
 SRC_DIR="${src}"
 DEST_DIR="${dest}"
@@ -170,6 +218,8 @@ EOF
     cat >> "$script_path" <<'SCRIPT_BODY'
 
 log() { printf '[%s] [%s] %s\n' "$(date -u '+%Y-%m-%d %H:%M:%S UTC')" "$NAME" "$*"; }
+
+log "backup-encrypt v${INSTALLER_VERSION} (job=${NAME})"
 
 [[ -d "$SRC_DIR" ]]  || { log "ERROR: source not found: $SRC_DIR"; exit 1; }
 [[ -r "$PASS_FILE" ]] || { log "ERROR: passphrase file not readable: $PASS_FILE"; exit 1; }
@@ -221,11 +271,18 @@ main() {
         exit 0
     fi
 
+    if [[ "${1:-}" == "--version" || "${1:-}" == "-v" ]]; then
+        printf 'backup-encrypt installer v%s\n' "$VERSION"
+        exit 0
+    fi
+
     require_root
     ensure_deps
 
     c_cyan "================================================"
     c_cyan "  通用加密备份配置向导 (GPG AES256 + tar.gz)"
+    c_cyan "  installer v${VERSION}"
+    c_cyan "  gpg: $(gpg --version | head -1)"
     c_cyan "================================================"
     echo
 
@@ -276,6 +333,9 @@ main() {
     printf '%s' "$password" > "$pass_file"
     chmod 600 "$pass_file"
     unset password
+
+    # 用真实密码文件验证 gpg loopback 可用，必要时自修复 gpg-agent.conf
+    gpg_self_test "$pass_file"
 
     # 生成备份脚本
     write_backup_script "$script_path" "$name" "$src" "$dest" "$pass_file" "$retention"
