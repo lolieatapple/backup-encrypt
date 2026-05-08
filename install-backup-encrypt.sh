@@ -11,7 +11,7 @@
 
 set -euo pipefail
 
-VERSION="0.2.0"
+VERSION="0.3.0"
 BIN_DIR="/usr/local/bin"
 ETC_DIR="/etc/backup-encrypt"
 LOG_DIR="/var/log"
@@ -44,50 +44,45 @@ ensure_deps() {
     fi
 }
 
-# 用真实密码文件做一次最小加密测试，验证 gpg loopback 可用。
-# 失败就尝试自动配置 gpg-agent.conf 的 allow-loopback-pinentry 并重载。
+# 预先确保 ~/.gnupg/gpg-agent.conf 包含 allow-loopback-pinentry。
+# 即便不缺也是幂等的；reload 让正在运行的 agent 立刻生效。
+ensure_gpg_loopback() {
+    local home="${GNUPGHOME:-$HOME/.gnupg}"
+    local conf="$home/gpg-agent.conf"
+    mkdir -p "$home"
+    chmod 700 "$home"
+    if [[ ! -f "$conf" ]] || ! grep -qE '^[[:space:]]*allow-loopback-pinentry' "$conf"; then
+        printf 'allow-loopback-pinentry\n' >> "$conf"
+        c_dim "✓ 已写入 $conf: allow-loopback-pinentry"
+    fi
+    gpgconf --kill gpg-agent >/dev/null 2>&1 || true
+    gpg-connect-agent reloadagent /bye >/dev/null 2>&1 || true
+}
+
+# 用真实密码文件做一次最小加密测试，验证 loopback 可用。
 gpg_self_test() {
     local pass_file="$1"
-    local err
-    _try_gpg() {
-        printf 'probe' \
-            | gpg --batch --yes --quiet --no-tty \
-                  --pinentry-mode loopback \
-                  --symmetric --cipher-algo AES256 \
-                  --compress-algo none \
-                  --passphrase-file "$pass_file" \
-                  --output /dev/null 2>&1
-    }
+    local size err
+    size=$(stat -c '%s' "$pass_file")
+    c_dim "密码文件 $pass_file: ${size} bytes"
+    if (( size == 0 )); then
+        die "密码文件为 0 字节，请重新安装并检查输入"
+    fi
 
-    if err=$(_try_gpg); then
-        c_dim "✓ gpg 加密自检通过"
+    if err=$(printf 'probe' \
+                | gpg --batch --yes --quiet --no-tty \
+                      --pinentry-mode loopback \
+                      --symmetric --cipher-algo AES256 \
+                      --compress-algo none \
+                      --passphrase-file "$pass_file" \
+                      --output /dev/null 2>&1); then
+        c_green "✓ gpg 加密自检通过"
         return 0
     fi
 
     c_red "gpg 加密自检失败:"
-    printf '%s\n' "$err" | sed 's/^/    /'
-
-    if printf '%s' "$err" | grep -qiE 'pinentry|loopback|inappropriate ioctl'; then
-        local home="${GNUPGHOME:-$HOME/.gnupg}"
-        local conf="$home/gpg-agent.conf"
-        c_cyan "尝试自动修复: 在 $conf 添加 allow-loopback-pinentry 并重载 gpg-agent"
-        mkdir -p "$home"
-        chmod 700 "$home"
-        if [[ ! -f "$conf" ]] || ! grep -qE '^[[:space:]]*allow-loopback-pinentry' "$conf"; then
-            printf 'allow-loopback-pinentry\n' >> "$conf"
-        fi
-        gpgconf --kill gpg-agent >/dev/null 2>&1 || true
-        gpg-connect-agent reloadagent /bye >/dev/null 2>&1 || true
-
-        if err=$(_try_gpg); then
-            c_green "✓ gpg-agent 修复后自检通过"
-            return 0
-        fi
-        c_red "修复后仍然失败:"
-        printf '%s\n' "$err" | sed 's/^/    /'
-    fi
-
-    die "gpg 加密失败，安装已中止 (可手动检查 gpg-agent / 密码文件)"
+    printf '%s\n' "$err" | sed 's/^/    /' >&2
+    die "gpg 加密失败，安装已中止 (gpg-agent.conf 已含 allow-loopback-pinentry，请检查密码文件内容或 gpg 版本)"
 }
 
 # ---------- 交互输入 ----------
@@ -97,24 +92,40 @@ prompt_default() {
     printf '%s' "${var:-$default}"
 }
 
+## NOTE: 这些 prompt 函数会被 $() 捕获 stdout 作为返回值。
+## 任何写到 stdout 的辅助输出都会污染返回值（曾导致密码文件首字节为换行，
+## 触发 gpg "Invalid passphrase"）。所有提示和报错必须显式写到 stderr。
+
 prompt_required() {
     local question="$1" var
     while :; do
         read -rp "$question: " var
         [[ -n "$var" ]] && { printf '%s' "$var"; return; }
-        c_red "不能为空"
+        c_red "不能为空" >&2
     done
 }
 
-prompt_password() {
-    local p1 p2
+# 直接把确认通过的密码写到 out_path（chmod 600）。
+# 既避开 $() 捕获污染问题，也不需要 bash 4.3 的 nameref。
+prompt_password_to_file() {
+    local out_path="$1"
+    local p1 p2 dir
+    dir=$(dirname "$out_path")
+    mkdir -p "$dir"
+    chmod 700 "$dir"
     while :; do
-        read -rsp "加密密码 (输入时不显示): " p1; echo
-        [[ -n "$p1" ]] || { c_red "密码不能为空"; continue; }
-        [[ ${#p1} -ge 8 ]] || { c_red "密码至少 8 位"; continue; }
-        read -rsp "再次输入确认: " p2; echo
-        [[ "$p1" == "$p2" ]] && { printf '%s' "$p1"; return; }
-        c_red "两次输入不一致，请重试"
+        read -rsp "加密密码 (输入时不显示): " p1
+        printf '\n' >&2
+        [[ -n "$p1" ]] || { c_red "密码不能为空" >&2; continue; }
+        [[ ${#p1} -ge 8 ]] || { c_red "密码至少 8 位" >&2; continue; }
+        read -rsp "再次输入确认: " p2
+        printf '\n' >&2
+        if [[ "$p1" == "$p2" ]]; then
+            ( umask 077; printf '%s' "$p1" > "$out_path" )
+            chmod 600 "$out_path"
+            return
+        fi
+        c_red "两次输入不一致，请重试" >&2
     done
 }
 
@@ -131,7 +142,7 @@ prompt_time_utc() {
                 return
             fi
         fi
-        c_red "格式错误，应为 HH:MM (如 10:00)"
+        c_red "格式错误，应为 HH:MM (如 10:00)" >&2
     done
 }
 
@@ -141,7 +152,7 @@ prompt_int() {
         read -rp "$question [$default]: " raw
         raw=${raw:-$default}
         [[ "$raw" =~ ^[0-9]+$ ]] && { printf '%s' "$raw"; return; }
-        c_red "请输入非负整数"
+        c_red "请输入非负整数" >&2
     done
 }
 
@@ -278,6 +289,7 @@ main() {
 
     require_root
     ensure_deps
+    ensure_gpg_loopback
 
     c_cyan "================================================"
     c_cyan "  通用加密备份配置向导 (GPG AES256 + tar.gz)"
@@ -286,7 +298,7 @@ main() {
     c_cyan "================================================"
     echo
 
-    local name src dest retention password
+    local name src dest retention
     local time_pair minute hour
 
     name=$(prompt_default "任务名 (用作文件名前缀，仅字母数字横线)" "keystore")
@@ -303,7 +315,6 @@ main() {
     minute=${time_pair% *}
     hour=${time_pair#* }
     retention=$(prompt_int "保留天数 (0 表示不清理)" "30")
-    password=$(prompt_password)
 
     local script_path="${BIN_DIR}/backup-encrypt-${name}.sh"
     local pass_file="${ETC_DIR}/${name}.pass"
@@ -326,15 +337,10 @@ main() {
     fi
     prompt_yes "确认安装?" "Y" || { c_red "已取消"; exit 1; }
 
-    # 写密码文件
-    mkdir -p "$ETC_DIR"
-    chmod 700 "$ETC_DIR"
-    umask 077
-    printf '%s' "$password" > "$pass_file"
-    chmod 600 "$pass_file"
-    unset password
+    # 输入并直接写入密码文件 (函数内 chmod 600)
+    prompt_password_to_file "$pass_file"
 
-    # 用真实密码文件验证 gpg loopback 可用，必要时自修复 gpg-agent.conf
+    # 用真实密码文件验证 gpg loopback 可用
     gpg_self_test "$pass_file"
 
     # 生成备份脚本
@@ -371,4 +377,7 @@ main() {
     c_green "卸载命令: sudo $0 --uninstall ${name}"
 }
 
-main "$@"
+# 只在被直接执行时跑 main，方便测试脚本 source 同一份函数定义
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
+fi
